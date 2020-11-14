@@ -10,8 +10,8 @@ import datetime
 
 TOTAL_EPISODES = 500
 T = 500
-LR = 0.01
-GAMMA = 0.95
+LR = 0.001
+GAMMA = 0.90
 MIN_EPSILON = 0.01
 EPSILON_DECAY_RATE = 0.9995
 epsilon = 1.0  # moving epsilon
@@ -19,8 +19,8 @@ epsilon = 1.0  # moving epsilon
 env = gym.make('CartPole-v1')
 state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
-batch_size = 12
-C = 10
+batch_size = 1  # size actually defined by experience_replay size
+C = 4
 deque_size = 2000
 train_start = batch_size * 10
 
@@ -70,6 +70,8 @@ def sample_batch(_memory, _batch_size, _action_size, _target_model, _gamma):
     target = np.zeros((_batch_size, _action_size))
     target_next = _target_model.predict(next_state_batch)
 
+    # print("reward_batch:{}".format(reward_batch))
+
     for i in range(_batch_size):
         # correction on the Q value for the action used
         if done_batch[i]:
@@ -78,7 +80,7 @@ def sample_batch(_memory, _batch_size, _action_size, _target_model, _gamma):
             # Q_max = max_a' Q_target(s', a')
             target[i][action_batch[i]] = reward_batch[i] + _gamma * (np.amax(target_next[i]))  # for non-terminal transition
 
-    return state_batch, target
+    # return state_batch, target
 
 
 def sample_action(_epsilon, _action_size, _model, _state):
@@ -100,6 +102,7 @@ for e in range(TOTAL_EPISODES):
     state = env.reset()
     state = np.reshape(state, [1, state_size])
     done = False
+    ttl_reward = 0
     for step in range(env._max_episode_steps):     # env max steps = 500
 
         action, target = sample_action(epsilon, action_size, model, state)
@@ -109,8 +112,10 @@ for e in range(TOTAL_EPISODES):
 
         next_state, reward, done, _ = env.step(action)
         next_state = np.reshape(next_state, [1, state_size])
+        ttl_reward += reward
+        norm_reward = ttl_reward/500
         # print("experience_replay:{}".format((state, action, reward, next_state, done)))
-        experience_replay.append((state, action, reward, next_state, done))
+        experience_replay.append((state, action, norm_reward, next_state, done))
 
         state = next_state
 
