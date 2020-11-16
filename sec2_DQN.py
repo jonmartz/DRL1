@@ -11,12 +11,6 @@ import tensorflow as tf
 import datetime
 from log import Log
 
-tf.config.threading.set_intra_op_parallelism_threads(2)
-tf.config.threading.set_inter_op_parallelism_threads(4)
-
-os.environ['TF_NUM_INTEROP_THREADS'] = '2'
-os.environ['TF_NUM_INTRAOP_THREADS'] = '4'
-
 
 TOTAL_EPISODES = 1_500
 LR = 0.001
@@ -80,49 +74,50 @@ def build_model(_state_size, _action_size, _learning_rate, _layers, _optimizer):
 
 
 def train_agent(_model, _target_model, _memory, _terminal_state, _step, _batch_size, _gamma):
-        # training only if memory is up to
-        if len(_memory) < MIN_REPLAY_MEMORY_SIZE:
-            return
+    # training only if memory is up to
+    if len(_memory) < MIN_REPLAY_MEMORY_SIZE:
+        return 0.0
 
-        # Get a minibatch of random samples from memory replay table
-        sample_batch = random.sample(_memory, _batch_size)
-        # print("sample_batch[0]:\n\tstate{}\n\taction:{}\n\treward:{}\n\tn_state:{}\n\tdont:{}\n"
-        #       .format(sample_batch[0][0], sample_batch[0][1],
-        #               sample_batch[0][2], sample_batch[0][3],
-        #               sample_batch[0][4]))
+    # Get a minibatch of random samples from memory replay table
+    sample_batch = random.sample(_memory, _batch_size)
+    # print("sample_batch[0]:\n\tstate{}\n\taction:{}\n\treward:{}\n\tn_state:{}\n\tdont:{}\n"
+    #       .format(sample_batch[0][0], sample_batch[0][1],
+    #               sample_batch[0][2], sample_batch[0][3],
+    #               sample_batch[0][4]))
 
-        # minibatch->current states , then get Q values from NN model
-        current_states = np.array([transition[0] for transition in sample_batch])
-        current_qs_list = _model.predict(current_states)
+    # minibatch->current states , then get Q values from NN model
+    current_states = np.array([transition[0] for transition in sample_batch])
+    current_qs_list = _model.predict(current_states)
 
-        # same for next state
-        # When using target network, query it, otherwise main network should be queried
-        new_current_states = np.array([transition[3] for transition in sample_batch])
-        future_qs_list = _target_model.predict(new_current_states)
+    # same for next state
+    # When using target network, query it, otherwise main network should be queried
+    new_current_states = np.array([transition[3] for transition in sample_batch])
+    future_qs_list = _target_model.predict(new_current_states)
 
-        X = []
-        y = []
+    X = []
+    y = []
 
-        for index, (current_state, i_action, i_reward, new_current_state, i_done) in enumerate(sample_batch):
+    for index, (current_state, i_action, i_reward, new_current_state, i_done) in enumerate(sample_batch):
 
-            if not i_done:
-                new_q = i_reward + _gamma * np.max(future_qs_list[index])   # not a terminal state
-            else:
-                new_q = i_reward                                            # terminal state
+        if not i_done:
+            new_q = i_reward + _gamma * np.max(future_qs_list[index])   # not a terminal state
+        else:
+            new_q = i_reward                                            # terminal state
 
-            # Update Q value for given state
-            current_qs = current_qs_list[index]
-            current_qs[i_action] = new_q
+        # Update Q value for given state
+        current_qs = current_qs_list[index]
+        current_qs[i_action] = new_q
 
-            # add to our training data
-            X.append(current_state)
-            y.append(current_qs)
+        # add to our training data
+        X.append(current_state)
+        y.append(current_qs)
 
-        # fit as one batch, tensorboard log only on terminal state
-        # tensorboard still need solving
-        _model.fit(np.array(X), np.array(y),
-                   batch_size=_batch_size, verbose=0, shuffle=False)
-        return _model.history[0]
+    # fit as one batch, tensorboard log only on terminal state
+    # tensorboard still need solving
+    history = _model.fit(np.array(X), np.array(y),
+               batch_size=_batch_size, verbose=0, shuffle=False)
+    loss = history.history['loss']
+    return loss[0]
 
 
 def old_sample_batch(_memory, _batch_size, _action_size, _target_model, _gamma):
@@ -205,6 +200,7 @@ def train(_params, _save=False):
         # state = np.reshape(state, [1, state_size])
         done = False
         ttl_reward = 0
+        los_ttl = 0
         for step in range(train_MAX_STEPS):     # env max steps = 500
 
             action = sample_action(train_epsilon, train_action_size, model, state)
@@ -220,7 +216,8 @@ def train(_params, _save=False):
             # print("experience_replay:{}".format((state, action, reward, next_state, done)))
             experience_replay.append((state, action, norm_reward, next_state, done))
             loss = train_agent(model, target_model, experience_replay, done, step, train_batch_size, train_GAMMA)
-            losses.append(loss)
+            los_ttl += loss
+            # losses.append()loss
             state = next_state
 
             if step % train_C == 0:
@@ -237,7 +234,7 @@ def train(_params, _save=False):
         # end step loop
         reward_arr.append(step)
         logger.write("episode: {:4}/{} steps: {:3} eps: {:.2} avg100: {:.4} loss: {:.4}\n".format(
-            e, train_TOTAL_EPISODES, step, train_epsilon, np.average(reward_arr), loss))
+            e, train_TOTAL_EPISODES, step, train_epsilon, np.average(reward_arr), los_ttl))
     # end episode loop
     if _save is True:
         save_training_res(model, target_model, model_dir, _params)
