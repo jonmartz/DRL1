@@ -10,11 +10,17 @@ from tensorflow.keras.backend import clear_session
 import tensorflow as tf
 import datetime
 from log import Log
+from tensorflow.keras.callbacks import TensorBoard
+# import time
+
+tf.compat.v1.disable_eager_execution() # uncomment if needed
+if tf.executing_eagerly():
+    print('Executing eagerly')
 
 
 TOTAL_EPISODES = 1_500
 LR = 0.001
-GAMMA = 0.9
+GAMMA = 0.97
 MIN_EPSILON = 0.001
 EPSILON_DECAY_RATE = 0.9995
 epsilon = 1.0  # moving epsilon
@@ -25,7 +31,7 @@ state_size = env.observation_space.shape[0]
 action_size = env.action_space.n
 MAX_STEPS = env._max_episode_steps
 
-batch_size = 64  # size actually defined by experience_replay size
+batch_size = 16  # size actually defined by experience_replay size
 C = 80  # set target weights every C
 deque_size = 500
 MIN_REPLAY_MEMORY_SIZE = 140    # fill replay memory and than use it
@@ -33,9 +39,63 @@ OPTIMIZER = "RMSprop"
 
 render = False
 
-# log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-# tensorboard = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
-tensorboard = None
+fqs_max = 0
+
+
+# Own Tensorboard class
+class ModifiedTensorBoard(TensorBoard):
+
+    # Overriding init to set initial step and writer (we want one log file for all .fit() calls)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.step = 1
+        self.model = None
+        self.TB_graph = tf.compat.v1.Graph()
+        with self.TB_graph.as_default():
+            self.writer = tf.summary.create_file_writer(self.log_dir, flush_millis=5000)
+            self.writer.set_as_default()
+            self.all_summary_ops = tf.compat.v1.summary.all_v2_summary_ops()
+        self.TB_sess = tf.compat.v1.InteractiveSession(graph=self.TB_graph)
+        self.TB_sess.run(self.writer.init())
+
+    # Overriding this method to stop creating default log writer
+    def set_model(self, model):
+        self.model = model
+        self._train_dir = self.log_dir + '\\train'
+
+    # Overrided, saves logs with our step number
+    # (otherwise every .fit() will start writing from 0th step)
+    def on_epoch_end(self, epoch, logs=None):
+        self.update_stats(**logs)
+
+    # Overrided
+    # We train for one batch only, no need to save anything at epoch end
+    def on_batch_end(self, batch, logs=None):
+        pass
+
+    def on_train_begin(self, logs=None):
+        pass
+
+    # Overrided, so won't close writer
+    def on_train_end(self, _):
+        pass
+
+    # added for performance?
+    def on_train_batch_end(self, _, __):
+        pass
+
+    # Custom method for saving own metrics
+    # Creates writer, writes custom metrics and closes writer
+    def update_stats(self, **stats):
+        self._write_logs(stats, self.step)
+
+    def _write_logs(self, logs, index):
+        for name, value in logs.items():
+            self.TB_sess.run(self.all_summary_ops)
+            if self.model is not None:
+                name = f'{name}_{self.model.name}'
+            self.TB_sess.run(tf.summary.scalar(name, value, step=index))
+        self.model = None
 
 
 # layers3=30,22
@@ -43,7 +103,7 @@ def build_model(_state_size, _action_size, _learning_rate, _layers, _optimizer):
     LR = float(_learning_rate)
     my_model = Sequential()
     _option = len(_layers) + 1
-    print("_layers[0],[1]:{},{}".format(_layers[0], _layers[1]))
+    # print("_layers[0],[1]:{},{}".format(_layers[0], _layers[1]))
     if _option == 3:
         print("3 Layers")
         my_model.add(Dense(_layers[0], input_dim=_state_size, activation='relu'))
@@ -59,7 +119,6 @@ def build_model(_state_size, _action_size, _learning_rate, _layers, _optimizer):
         return
 
     my_model.add(Dense(action_size, activation='linear'))
-    print('_learning_rate:{}'.format(type(LR)))
     if _optimizer == "RMSprop":
         my_model.compile(loss='mse', optimizer=RMSprop(lr=LR))
     elif _optimizer == "SGD":
@@ -73,7 +132,41 @@ def build_model(_state_size, _action_size, _learning_rate, _layers, _optimizer):
     return my_model
 
 
-def train_agent(_model, _target_model, _memory, _terminal_state, _step, _batch_size, _gamma):
+def train_agent(_model, _target_model, _memory, _terminal_state, _step, _batch_size, _gamma, _tensorboard):
+    global fqs_max
+
+    """
+    Observation:
+        Type: Box(4)
+        Num     Observation               Min                     Max
+        0       Cart Position             -4.8                    4.8
+        1       Cart Velocity             -Inf                    Inf
+        2       Pole Angle                -0.418 rad (-24 deg)    0.418 rad (24 deg)
+        3       Pole Angular Velocity     -Inf                    Inf
+    Actions:
+        Type: Discrete(2)
+        Num   Action
+        0     Push cart to the left
+        1     Push cart to the right
+        Note: The amount the velocity that is reduced or increased is not
+        fixed; it depends on the angle the pole is pointing. This is because
+        the center of gravity of the pole increases the amount of energy needed
+        to move the cart underneath it
+    Reward:
+        Reward is 1 for every step taken, including the termination step
+    Starting State:
+        All observations are assigned a uniform random value in [-0.05..0.05]
+    Episode Termination:
+        Pole Angle is more than 12 degrees.
+        Cart Position is more than 2.4 (center of the cart reaches the edge of
+        the display).
+        Episode length is greater than 200.
+        Solved Requirements:
+        Considered solved when the average return is greater than or equal to
+        195.0 over 100 consecutive trials.
+    """
+
+
     # training only if memory is up to
     if len(_memory) < MIN_REPLAY_MEMORY_SIZE:
         return 0.0
@@ -86,19 +179,18 @@ def train_agent(_model, _target_model, _memory, _terminal_state, _step, _batch_s
     #               sample_batch[0][4]))
 
     # minibatch->current states , then get Q values from NN model
-    current_states = np.array([transition[0] for transition in sample_batch])
-    current_qs_list = _model.predict(current_states)
+    current_states = np.array([data[0] for data in sample_batch])
+    current_qs_list = _model.predict(current_states)    # fast model
 
     # same for next state
     # When using target network, query it, otherwise main network should be queried
-    new_current_states = np.array([transition[3] for transition in sample_batch])
-    future_qs_list = _target_model.predict(new_current_states)
+    new_current_states = np.array([data[3] for data in sample_batch])
+    future_qs_list = _target_model.predict(new_current_states)  # stable model
 
     X = []
     y = []
 
     for index, (current_state, i_action, i_reward, new_current_state, i_done) in enumerate(sample_batch):
-
         if not i_done:
             new_q = i_reward + _gamma * np.max(future_qs_list[index])   # not a terminal state
         else:
@@ -113,45 +205,15 @@ def train_agent(_model, _target_model, _memory, _terminal_state, _step, _batch_s
         y.append(current_qs)
 
     # fit as one batch, tensorboard log only on terminal state
-    # tensorboard still need solving
-    history = _model.fit(np.array(X), np.array(y),
-               batch_size=_batch_size, verbose=0, shuffle=False)
+    if _terminal_state:
+        history = _model.fit(np.array(X), np.array(y),
+                             batch_size=_batch_size, verbose=0, shuffle=False,
+                             callbacks=[_tensorboard])
+    else:
+        history = _model.fit(np.array(X), np.array(y),
+                             batch_size=_batch_size, verbose=0, shuffle=False)
     loss = history.history['loss']
     return loss[0]
-
-
-def old_sample_batch(_memory, _batch_size, _action_size, _target_model, _gamma):
-    if len(_memory) < train_start:
-        return
-    minibatch = random.sample(_memory, min(len(_memory), _batch_size))
-    # Initialize
-    state_batch = np.zeros((_batch_size, 4))
-    next_state_batch = np.zeros((_batch_size, 4))
-    action_batch, reward_batch, done_batch = [], [], []
-
-    for i in range(_batch_size):
-        state_batch[i] = minibatch[i][0]
-        action_batch.append(minibatch[i][1])
-        reward_batch.append(minibatch[i][2])
-        next_state_batch[i] = minibatch[i][3]
-        done_batch.append(minibatch[i][4])
-
-    # do batch prediction to save speed
-    target = np.zeros((_batch_size, _action_size))
-    target_next = _target_model.predict(next_state_batch)
-
-    # print("reward_batch:{}".format(reward_batch))
-
-    for i in range(_batch_size):
-        # correction on the Q value for the action used
-        if done_batch[i]:
-            target[i][action_batch[i]] = reward_batch[i]  # for terminal transition
-        else:
-            # Q_max = max_a' Q_target(s', a')
-            target[i][action_batch[i]] = reward_batch[i] + _gamma * (np.amax(target_next[i]))  # for non-terminal transition
-    print("state_batch, target_batch:{},{}".format(state_batch, target))
-    # return state_batch, target
-    return 0, 0
 
 
 def sample_action(_epsilon, _action_size, _model, _state):
@@ -165,6 +227,8 @@ def sample_action(_epsilon, _action_size, _model, _state):
 
 def train(_params, _save=False):
     time_started = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    tensorboard = ModifiedTensorBoard(log_dir="logs/{}-{}".format("train", time_started))
+
     model_dir = "saved_model/" + time_started
     logger = Log(model_dir, "log.log")
     logger.write("{} \t\t Training params:\n".format(time_started))
@@ -198,6 +262,7 @@ def train(_params, _save=False):
     for e in range(train_TOTAL_EPISODES):
         state = env.reset()
         # state = np.reshape(state, [1, state_size])
+        tensorboard.step = e
         done = False
         ttl_reward = 0
         los_ttl = 0
@@ -215,7 +280,8 @@ def train(_params, _save=False):
             norm_reward = ttl_reward/500
             # print("experience_replay:{}".format((state, action, reward, next_state, done)))
             experience_replay.append((state, action, norm_reward, next_state, done))
-            loss = train_agent(model, target_model, experience_replay, done, step, train_batch_size, train_GAMMA)
+            loss = train_agent(model, target_model, experience_replay, done,
+                               step, train_batch_size, train_GAMMA, tensorboard)
             los_ttl += loss
             # losses.append()loss
             state = next_state
@@ -233,6 +299,10 @@ def train(_params, _save=False):
                     train_epsilon *= train_EPSILON_DECAY_RATE
         # end step loop
         reward_arr.append(step)
+        tensorboard.update_stats(reward_steps=step,
+                                 reward_avg100=np.average(reward_arr),
+                                 epsilon=train_epsilon)
+
         logger.write("episode: {:4}/{} steps: {:3} eps: {:.2} avg100: {:.4} loss: {:.4}\n".format(
             e, train_TOTAL_EPISODES, step, train_epsilon, np.average(reward_arr), los_ttl))
     # end episode loop
@@ -249,7 +319,7 @@ def save_training_res(_model, _target_model, _folder, _params):
 
     _model.save(model_dir)
     _target_model.save(target_model_dir)
-    clear_session()
+    # clear_session()
 
 
 def initialize_parameters_from_global():
@@ -264,17 +334,20 @@ def initialize_parameters_from_global():
 
 def main():
     params = initialize_parameters_from_global()
-    params['layers'] = (16, 12)
+    params['layers'] = (64, 64)
     params['TOTAL_EPISODES'] = 1_500
+    params['batch_size'] = 64
+    params['GAMMA'] = 0.999
+    params['EPSILON_DECAY_RATE'] = 0.99992
+    params['deque_size'] = 100_000
+    params['C'] = 200
 
-    params['batch_size'] = 128
+    params['LR'] = 0.005
     train(params, True)     # save = True
 
-    params['batch_size'] = 32
+    params['LR'] = 0.008
     train(params, True)
 
-    params['batch_size'] = 16
-    train(params, True)
 
 if __name__ == '__main__':
     main()
